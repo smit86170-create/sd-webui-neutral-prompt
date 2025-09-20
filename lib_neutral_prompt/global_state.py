@@ -7,6 +7,7 @@ prompt_exprs: List[neutral_prompt_parser.PromptExpr] = []
 cfg_rescale: float = 0.0
 verbose: bool = True
 cfg_rescale_override: Optional[float] = None
+cfg_rescale_factor: Optional[float] = None
 
 
 def apply_and_clear_cfg_rescale_override():
