@@ -573,7 +573,6 @@ def create_sampler_hijack(name: str, model, original_function):
         return sampler
 
     sampler.model_wrap_cfg.combine_denoised = functools.partial(
-@@ -233,25 +577,29 @@ def create_sampler_hijack(name: str, model, original_function):
         original_function=sampler.model_wrap_cfg.combine_denoised
     )
     return sampler
