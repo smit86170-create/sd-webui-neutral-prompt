@@ -1,8 +1,11 @@
+from itertools import product
+import dataclasses
+from typing import Callable, Dict, List, Tuple
+
+import gradio as gr
+
 from lib_neutral_prompt import global_state, neutral_prompt_parser
 from modules import script_callbacks, shared
-from typing import Dict, Tuple, List, Callable
-import gradio as gr
-import dataclasses
 
 
 txt2img_prompt_textbox = None
@@ -19,7 +22,17 @@ prompt_types_tooltip = '\n'.join([
     'Perpendicular - reduce the impact of contradicting prompt features',
     'Saliency-aware - strongest prompt features win',
     'Semantic guidance top-k - small targeted changes',
+    'AND_ALIGN_d_s - blend new details with detail kernel d and structure kernel s',
+    'AND_MASK_ALIGN_d_s - mask-aligned blend with detail kernel d and structure kernel s',
 ])
+
+for detail, structure in (pair for pair in product(range(2, 33), repeat=2) if pair[0] != pair[1]):
+    prompt_types[
+        f'Local alignment blend (detail {detail}, structure {structure})'
+    ] = neutral_prompt_parser.make_alignment_keyword(detail, structure)
+    prompt_types[
+        f'Local alignment mask blend (detail {detail}, structure {structure})'
+    ] = neutral_prompt_parser.make_alignment_mask_keyword(detail, structure)
 
 
 @dataclasses.dataclass
