@@ -162,3 +162,56 @@ def test_combine_denoised_hijack_handles_multicond_batch():
         global_state.prompt_exprs = previous_prompts
         global_state.cfg_rescale = previous_cfg_rescale
         global_state.cfg_rescale_factor = previous_cfg_rescale_factor
+
+
+@pytest.mark.skipif(torch is None, reason="torch required for combine hijack integration test")
+def test_combine_denoised_hijack_broadcasts_single_uncond():
+    previous_enabled = global_state.is_enabled
+    previous_prompts = global_state.prompt_exprs
+    previous_cfg_rescale = global_state.cfg_rescale
+    previous_cfg_rescale_factor = global_state.cfg_rescale_factor
+
+    try:
+        global_state.is_enabled = True
+        prompts = ["cat", "dog"]
+        global_state.prompt_exprs = prompt_parser_hijack.parse_prompts(prompts)
+
+        schedules = [prompt_parser.ScheduledPromptConditioning(10, torch.zeros((1, 1, 1)))]
+        parts = [prompt_parser.ComposableScheduledPromptConditioning(schedules, 1.0)]
+        multicond = prompt_parser.MulticondLearnedConditioning(shape=(1,), batch=[parts, parts])
+
+        cond_a = torch.full((1, 1, 1), 0.1)
+        cond_b = torch.full((1, 1, 1), 0.2)
+        uncond = torch.zeros((1, 1, 1))
+        x_out = torch.stack([cond_a, cond_b, uncond], dim=0)
+        text_uncond = torch.zeros((1, 1, 1))
+        cond_scale = 1.0
+
+        captured = {}
+
+        def original_function(sliced_x_out, converted_batch, text_uncond_arg, cond_scale_arg):
+            captured["shape"] = sliced_x_out.shape
+            captured["weights"] = [
+                [part.weight for part in prompt_parts] for prompt_parts in converted_batch.batch
+            ]
+            assert text_uncond_arg is text_uncond
+            assert cond_scale_arg == cond_scale
+            return sliced_x_out.clone()
+
+        result = combine_denoised_hijack(
+            x_out=x_out,
+            batch_cond_indices=multicond,
+            text_uncond=text_uncond,
+            cond_scale=cond_scale,
+            original_function=original_function,
+        )
+
+        assert captured["shape"] == torch.Size([3, 1, 1, 1])
+        assert captured["weights"] == [[1.0], [1.0]]
+        assert result.shape == x_out.shape
+        assert torch.allclose(result[-1], x_out[-1])
+    finally:
+        global_state.is_enabled = previous_enabled
+        global_state.prompt_exprs = previous_prompts
+        global_state.cfg_rescale = previous_cfg_rescale
+        global_state.cfg_rescale_factor = previous_cfg_rescale_factor

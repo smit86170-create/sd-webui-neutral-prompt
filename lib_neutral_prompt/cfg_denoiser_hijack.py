@@ -96,6 +96,23 @@ class BatchCondAdapter:
 
         return converted
 
+def _select_uncond(uncond: torch.Tensor, index: int) -> torch.Tensor:
+    if uncond.ndim == 0:
+        return uncond
+
+    uncond_count = uncond.shape[0]
+    if uncond_count == 0:
+        raise ValueError('Unconditional batch is empty')
+
+    if uncond_count == 1:
+        return uncond[0]
+
+    if index < uncond_count:
+        return uncond[index]
+
+    return uncond[index % uncond_count]
+
+
 def combine_denoised_hijack(
     x_out: torch.Tensor,
     batch_cond_indices,
@@ -111,11 +128,12 @@ def combine_denoised_hijack(
     uncond = x_out[-text_uncond.shape[0]:]
 
     for batch_i, (prompt, cond_infos) in enumerate(zip(global_state.prompt_exprs, adapter.normalized_batch)):
-        args = CombineDenoiseArgs(x_out, uncond[batch_i], cond_infos)
+        uncond_tensor = _select_uncond(uncond, batch_i)
+        args = CombineDenoiseArgs(x_out, uncond_tensor, cond_infos)
         cond_delta = prompt.accept(CondDeltaVisitor(), args, 0)
         aux_cond_delta = prompt.accept(AuxCondDeltaVisitor(), args, cond_delta, 0)
         cfg_cond = denoised[batch_i] + aux_cond_delta * cond_scale
-        denoised[batch_i] = cfg_rescale(cfg_cond, uncond[batch_i] + cond_delta + aux_cond_delta)
+        denoised[batch_i] = cfg_rescale(cfg_cond, uncond_tensor + cond_delta + aux_cond_delta)
 
     return denoised
 
@@ -132,7 +150,8 @@ def get_webui_denoised(
     sliced_batch_cond_infos = []
 
     for batch_i, (prompt, cond_infos) in enumerate(zip(global_state.prompt_exprs, adapter.normalized_batch)):
-        args = CombineDenoiseArgs(x_out, uncond[batch_i], cond_infos)
+        uncond_tensor = _select_uncond(uncond, batch_i)
+        args = CombineDenoiseArgs(x_out, uncond_tensor, cond_infos)
         sliced_x_out, reindexed_infos = gather_webui_conds(prompt, args, 0, len(sliced_batch_x_out))
         if reindexed_infos:
             sliced_batch_cond_infos.append(reindexed_infos)
