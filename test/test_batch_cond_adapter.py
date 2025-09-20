@@ -3,13 +3,21 @@ import pathlib
 import sys
 import types
 
+import pytest
+
 repo_root = pathlib.Path(__file__).resolve().parent.parent
 sys.path.append(str(repo_root))
 
 prompt_parser_path = repo_root / "AUTOMATIC1111" / "stable-diffusion-webui" / "modules" / "prompt_parser.py"
 spec = importlib.util.spec_from_file_location("modules.prompt_parser", prompt_parser_path)
 prompt_parser = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(prompt_parser)
+
+try:
+    spec.loader.exec_module(prompt_parser)
+except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+    if exc.name == "lark":
+        pytest.skip("prompt_parser requires lark", allow_module_level=True)
+    raise
 
 modules_pkg = types.ModuleType("modules")
 script_callbacks_mod = types.ModuleType("modules.script_callbacks")
