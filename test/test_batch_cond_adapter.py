@@ -1,18 +1,49 @@
+import importlib.util
 import pathlib
 import sys
+import types
 
-import pytest
+repo_root = pathlib.Path(__file__).resolve().parent.parent
+sys.path.append(str(repo_root))
 
-torch = pytest.importorskip("torch")
+prompt_parser_path = repo_root / "AUTOMATIC1111" / "stable-diffusion-webui" / "modules" / "prompt_parser.py"
+spec = importlib.util.spec_from_file_location("modules.prompt_parser", prompt_parser_path)
+prompt_parser = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(prompt_parser)
 
-sys.path.append(str(pathlib.Path(__file__).resolve().parent.parent))
+modules_pkg = types.ModuleType("modules")
+script_callbacks_mod = types.ModuleType("modules.script_callbacks")
+script_callbacks_mod.on_script_unloaded = lambda _callback: None
+
+class _DummyModelWrapCfg:
+    def __init__(self):
+        self.combine_denoised = lambda *args, **kwargs: None
+
+def _create_sampler(_name, _model):
+    return types.SimpleNamespace(model_wrap_cfg=_DummyModelWrapCfg())
+
+sd_samplers_mod = types.ModuleType("modules.sd_samplers")
+sd_samplers_mod.create_sampler = _create_sampler
+
+shared_mod = types.ModuleType("modules.shared")
+shared_mod.state = types.SimpleNamespace(sampling_step=0)
+
+modules_pkg.prompt_parser = prompt_parser
+modules_pkg.script_callbacks = script_callbacks_mod
+modules_pkg.sd_samplers = sd_samplers_mod
+modules_pkg.shared = shared_mod
+
+sys.modules.setdefault("modules", modules_pkg)
+sys.modules["modules.prompt_parser"] = prompt_parser
+sys.modules["modules.script_callbacks"] = script_callbacks_mod
+sys.modules["modules.sd_samplers"] = sd_samplers_mod
+sys.modules["modules.shared"] = shared_mod
 
 from lib_neutral_prompt.cfg_denoiser_hijack import BatchCondAdapter, ReindexedCondInfo
-from modules import prompt_parser
 
 
 def _make_multicond(weights):
-    schedules = [prompt_parser.ScheduledPromptConditioning(5, torch.zeros(1, 4))]
+    schedules = [prompt_parser.ScheduledPromptConditioning(5, object())]
     parts = [prompt_parser.ComposableScheduledPromptConditioning(schedules, w) for w in weights]
     return prompt_parser.MulticondLearnedConditioning(shape=(len(weights),), batch=[parts])
 

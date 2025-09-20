@@ -469,16 +469,30 @@ def life(
     if iterations <= 0:
         return board
 
-    kernel = torch.ones((board.shape[0], 1, 3, 3), dtype=board.dtype, device=board.device)
-    state = board.unsqueeze(1)
+    if board.ndim not in (2, 3):
+        return board
+
+    squeeze_channel_dim = board.ndim == 2
+    if squeeze_channel_dim:
+        board = board.unsqueeze(0)
+
+    channels = board.shape[0]
+    if channels == 0:
+        return board.squeeze(0) if squeeze_channel_dim else board
+
+    kernel = torch.ones((channels, 1, 3, 3), dtype=board.dtype, device=board.device)
+    state = board.unsqueeze(0)
 
     for _ in range(iterations):
-        neighbors = F.conv2d(state, kernel, padding=1, groups=board.shape[0])
+        neighbors = F.conv2d(state, kernel, padding=1, groups=channels)
         births = (neighbors >= birth_threshold * 9).to(board.dtype)
         survive = ((neighbors >= survive_min * 9) & (neighbors <= survive_max * 9)).to(board.dtype)
         state = torch.clamp(births + survive * state, 0.0, 1.0)
 
-    return state.squeeze(1)
+    result = state.squeeze(0)
+    if squeeze_channel_dim:
+        result = result.squeeze(0)
+    return result
 
 
 def salient_blend(normal: torch.Tensor, vectors: List[Tuple[torch.Tensor, float]]) -> torch.Tensor:

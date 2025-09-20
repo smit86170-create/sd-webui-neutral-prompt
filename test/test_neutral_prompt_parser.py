@@ -47,3 +47,33 @@ def test_apply_local_transform_identity():
     transform = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
     result = cfg_denoiser_hijack.apply_local_transform_to_delta(cond_delta, uncond, transform, 1.0)
     assert torch.allclose(result, cond_delta)
+
+
+@pytest.mark.skipif(torch is None, reason='torch required for life tests')
+def test_life_preserves_shape_for_multi_channel_board():
+    from lib_neutral_prompt import cfg_denoiser_hijack
+
+    board = torch.zeros((3, 4, 4))
+    board[0, 1, 1] = 1.0
+
+    result = cfg_denoiser_hijack.life(
+        board,
+        iterations=1,
+        birth_threshold=0.1,
+        survive_min=0.0,
+        survive_max=1.0,
+    )
+
+    assert result.shape == board.shape
+    assert torch.all(result >= 0)
+    assert torch.all(result <= 1)
+
+
+@pytest.mark.skipif(torch is None, reason='torch required for life tests')
+def test_life_accepts_2d_masks():
+    from lib_neutral_prompt import cfg_denoiser_hijack
+
+    board = torch.zeros((4, 4))
+    result = cfg_denoiser_hijack.life(board, iterations=1)
+
+    assert result.shape == board.shape
