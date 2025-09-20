@@ -386,9 +386,11 @@ def apply_affine_transform(tensor: torch.Tensor, affine: torch.Tensor) -> torch.
 
 def normalize_similarity_map(tensor: torch.Tensor) -> torch.Tensor:
     max_value = tensor.max()
-    if max_value <= 0:
+    # Приводим к Python-скаляру:
+    if max_value.le(0).item():
         return torch.zeros_like(tensor)
     return tensor / max_value
+
 
 
 def compute_subregion_similarity_map(
@@ -569,13 +571,17 @@ def create_sampler_hijack(name: str, model, original_function):
     if not hasattr(sampler, 'model_wrap_cfg') or not hasattr(sampler.model_wrap_cfg, 'combine_denoised'):
         if global_state.is_enabled:
             warn_unsupported_sampler()
-
         return sampler
 
+    # ВАЖНО: первым аргументом передаём нашу функцию-хук,
+    # а оригинальную функцию пробрасываем как именованный аргумент.
     sampler.model_wrap_cfg.combine_denoised = functools.partial(
-        original_function=sampler.model_wrap_cfg.combine_denoised
+        combine_denoised_hijack,
+        original_function=sampler.model_wrap_cfg.combine_denoised,
     )
     return sampler
+
+
 
 
 def warn_unsupported_sampler():
