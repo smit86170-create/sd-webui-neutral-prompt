@@ -1,6 +1,6 @@
 from lib_neutral_prompt import hijacker, global_state, neutral_prompt_parser
-from modules import script_callbacks, sd_samplers, shared
-from typing import Tuple, List
+from modules import prompt_parser, script_callbacks, sd_samplers, shared
+from typing import Tuple, List, Any
 import dataclasses
 import functools
 import torch
@@ -8,9 +8,75 @@ import sys
 import textwrap
 
 
+@dataclasses.dataclass(frozen=True)
+class NormalizedCondInfo:
+    x_out_index: int
+    weight: float
+    original: Any
+
+
+@dataclasses.dataclass(frozen=True)
+class ReindexedCondInfo:
+    info: NormalizedCondInfo
+    new_index: int
+    weight: float
+
+
+class BatchCondAdapter:
+    def __init__(self, batch_cond_indices):
+        self.original_batch = batch_cond_indices
+        self.format = self._detect_format(batch_cond_indices)
+        self.composable_cls = (
+            getattr(prompt_parser, 'ComposableScheduledPromptConditioning', None)
+            if self.format == 'composable'
+            else None
+        )
+
+        if self.format == 'composable' and self.composable_cls is None:
+            raise AttributeError('ComposableScheduledPromptConditioning not available in prompt_parser')
+
+        self.normalized_batch = self._normalize(batch_cond_indices)
+
+    def _detect_format(self, batch_cond_indices):
+        for conds in batch_cond_indices or []:
+            for cond in conds:
+                if isinstance(cond, (tuple, list)):
+                    return 'tuple'
+                if hasattr(cond, 'weight') and hasattr(cond, 'schedules'):
+                    return 'composable'
+                raise TypeError('Unsupported conditioning entry type')
+        return 'tuple'
+
+    def _normalize(self, batch_cond_indices):
+        normalized = []
+        running_index = 0
+        for conds in batch_cond_indices:
+            prompt_infos = []
+            for cond in conds:
+                if self.format == 'tuple':
+                    cond_index, weight = cond
+                    prompt_infos.append(NormalizedCondInfo(int(cond_index), float(weight), cond))
+                else:
+                    prompt_infos.append(NormalizedCondInfo(running_index, float(cond.weight), cond))
+                    running_index += 1
+            normalized.append(prompt_infos)
+        return normalized
+
+    def convert_prompt(self, prompt_infos):
+        if self.format == 'tuple':
+            return [(info.new_index, info.weight) for info in prompt_infos]
+
+        return [
+            self.composable_cls(info.info.original.schedules, info.weight)
+            for info in prompt_infos
+        ]
+
+    def convert_batch(self, batch_infos):
+        return [self.convert_prompt(prompt_infos) for prompt_infos in batch_infos]
+
 def combine_denoised_hijack(
     x_out: torch.Tensor,
-    batch_cond_indices: List[List[Tuple[int, float]]],
+    batch_cond_indices,
     text_uncond: torch.Tensor,
     cond_scale: float,
     original_function,
@@ -18,11 +84,12 @@ def combine_denoised_hijack(
     if not global_state.is_enabled:
         return original_function(x_out, batch_cond_indices, text_uncond, cond_scale)
 
-    denoised = get_webui_denoised(x_out, batch_cond_indices, text_uncond, cond_scale, original_function)
+    adapter = BatchCondAdapter(batch_cond_indices)
+    denoised = get_webui_denoised(x_out, adapter, text_uncond, cond_scale, original_function)
     uncond = x_out[-text_uncond.shape[0]:]
 
-    for batch_i, (prompt, cond_indices) in enumerate(zip(global_state.prompt_exprs, batch_cond_indices)):
-        args = CombineDenoiseArgs(x_out, uncond[batch_i], cond_indices)
+    for batch_i, (prompt, cond_infos) in enumerate(zip(global_state.prompt_exprs, adapter.normalized_batch)):
+        args = CombineDenoiseArgs(x_out, uncond[batch_i], cond_infos)
         cond_delta = prompt.accept(CondDeltaVisitor(), args, 0)
         aux_cond_delta = prompt.accept(AuxCondDeltaVisitor(), args, cond_delta, 0)
         cfg_cond = denoised[batch_i] + aux_cond_delta * cond_scale
@@ -33,25 +100,26 @@ def combine_denoised_hijack(
 
 def get_webui_denoised(
     x_out: torch.Tensor,
-    batch_cond_indices: List[List[Tuple[int, float]]],
+    adapter: BatchCondAdapter,
     text_uncond: torch.Tensor,
     cond_scale: float,
     original_function,
 ):
     uncond = x_out[-text_uncond.shape[0]:]
     sliced_batch_x_out = []
-    sliced_batch_cond_indices = []
+    sliced_batch_cond_infos = []
 
-    for batch_i, (prompt, cond_indices) in enumerate(zip(global_state.prompt_exprs, batch_cond_indices)):
-        args = CombineDenoiseArgs(x_out, uncond[batch_i], cond_indices)
-        sliced_x_out, sliced_cond_indices = gather_webui_conds(prompt, args, 0, len(sliced_batch_x_out))
-        if sliced_cond_indices:
-            sliced_batch_cond_indices.append(sliced_cond_indices)
+    for batch_i, (prompt, cond_infos) in enumerate(zip(global_state.prompt_exprs, adapter.normalized_batch)):
+        args = CombineDenoiseArgs(x_out, uncond[batch_i], cond_infos)
+        sliced_x_out, reindexed_infos = gather_webui_conds(prompt, args, 0, len(sliced_batch_x_out))
+        if reindexed_infos:
+            sliced_batch_cond_infos.append(reindexed_infos)
         sliced_batch_x_out.extend(sliced_x_out)
 
     sliced_batch_x_out += list(uncond)
     sliced_batch_x_out = torch.stack(sliced_batch_x_out, dim=0)
-    return original_function(sliced_batch_x_out, sliced_batch_cond_indices, text_uncond, cond_scale)
+    converted_cond_infos = adapter.convert_batch(sliced_batch_cond_infos)
+    return original_function(sliced_batch_x_out, converted_cond_infos, text_uncond, cond_scale)
 
 
 def cfg_rescale(cfg_cond, cond):
@@ -69,7 +137,7 @@ def cfg_rescale(cfg_cond, cond):
 class CombineDenoiseArgs:
     x_out: torch.Tensor
     uncond: torch.Tensor
-    cond_indices: List[Tuple[int, float]]
+    cond_infos: List[NormalizedCondInfo]
 
 
 def gather_webui_conds(
@@ -77,25 +145,26 @@ def gather_webui_conds(
     args: CombineDenoiseArgs,
     index_in: int,
     index_out: int,
-) -> Tuple[List[torch.Tensor], List[Tuple[int, float]]]:
+) -> Tuple[List[torch.Tensor], List[ReindexedCondInfo]]:
     sliced_x_out = []
-    sliced_cond_indices = []
+    sliced_cond_infos = []
 
     for child in prompt.children:
         if child.conciliation is None:
             if isinstance(child, neutral_prompt_parser.LeafPrompt):
-                child_x_out = args.x_out[args.cond_indices[index_in][0]]
+                child_info = args.cond_infos[index_in]
+                child_x_out = args.x_out[child_info.x_out_index]
             else:
                 child_x_out = child.accept(CondDeltaVisitor(), args, index_in)
                 child_x_out += child.accept(AuxCondDeltaVisitor(), args, child_x_out, index_in)
                 child_x_out += args.uncond
             index_offset = index_out + len(sliced_x_out)
             sliced_x_out.append(child_x_out)
-            sliced_cond_indices.append((index_offset, child.weight))
+            sliced_cond_infos.append(ReindexedCondInfo(args.cond_infos[index_in], index_offset, child.weight))
 
         index_in += child.accept(neutral_prompt_parser.FlatSizeVisitor())
 
-    return sliced_x_out, sliced_cond_indices
+    return sliced_x_out, sliced_cond_infos
 
 
 class CondDeltaVisitor:
@@ -105,17 +174,17 @@ class CondDeltaVisitor:
         args: CombineDenoiseArgs,
         index: int,
     ) -> torch.Tensor:
-        cond_info = args.cond_indices[index]
-        if that.weight != cond_info[1]:
+        cond_info = args.cond_infos[index]
+        if that.weight != cond_info.weight:
             console_warn(f'''
                 An unexpected noise weight was encountered at prompt #{index}
-                Expected :{that.weight}, but got :{cond_info[1]}
+                Expected :{that.weight}, but got :{cond_info.weight}
                 This is likely due to another extension also monkey patching the webui `combine_denoised` function
                 Please open a bug report here so that the conflict can be resolved:
                 https://github.com/ljleb/sd-webui-neutral-prompt/issues
             ''')
 
-        return args.x_out[cond_info[0]] - args.uncond
+        return args.x_out[cond_info.x_out_index] - args.uncond
 
     def visit_composite_prompt(
         self,
