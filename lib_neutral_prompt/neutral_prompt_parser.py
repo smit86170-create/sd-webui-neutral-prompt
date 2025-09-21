@@ -10,15 +10,7 @@ import sys
 
 import lark
 
-try:  # pragma: no cover - fallback for test environment without real modules package
-    from modules import prompt_parser as webui_prompt_parser
-except ModuleNotFoundError:  # pragma: no cover - executed in CI tests
-    repo_root = pathlib.Path(__file__).resolve().parent.parent
-    webui_path = repo_root / 'AUTOMATIC1111' / 'stable-diffusion-webui'
-    if str(webui_path) not in sys.path:
-        sys.path.append(str(webui_path))
-    from modules import prompt_parser as webui_prompt_parser
-
+from modules import prompt_parser as webui_prompt_parser
 
 class PromptKeyword(Enum):
     AND = 'AND'
