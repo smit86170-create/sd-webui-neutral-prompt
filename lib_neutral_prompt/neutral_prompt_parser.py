@@ -3,7 +3,21 @@ import dataclasses
 import math
 import re
 from enum import Enum
-from typing import List, Tuple, Any, Optional, Iterable
+from typing import Any, Iterable, List, Optional, Tuple
+
+import pathlib
+import sys
+
+import lark
+
+try:  # pragma: no cover - fallback for test environment without real modules package
+    from modules import prompt_parser as webui_prompt_parser
+except ModuleNotFoundError:  # pragma: no cover - executed in CI tests
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    webui_path = repo_root / 'AUTOMATIC1111' / 'stable-diffusion-webui'
+    if str(webui_path) not in sys.path:
+        sys.path.append(str(webui_path))
+    from modules import prompt_parser as webui_prompt_parser
 
 
 class PromptKeyword(Enum):
@@ -172,31 +186,85 @@ def conciliation_from_keyword(keyword: PromptKeyword) -> Optional[ConciliationSt
 
 
 def parse_prompt_text(tokens: List[str], *, nested: bool = False) -> Tuple[str, float]:
-    text = ''
-    depth = 0
-    weight = 1.
+    parts: List[str] = []
+    depth_square = 0
+    depth_brace = 0
+    depth_paren = 0
+
     while tokens:
-        next_keyword, _ = parse_prompt_keyword(tokens[0])
-        if tokens[0] == ']':
-            if depth == 0:
+        token = tokens[0]
+        keyword, _ = parse_prompt_keyword(token)
+
+        if token == '[':
+            depth_square += 1
+            parts.append(tokens.pop(0))
+            continue
+        if token == ']':
+            if depth_square == 0:
                 if nested:
                     break
             else:
-                depth -= 1
-        elif tokens[0] == '[':
-            depth += 1
-        elif tokens[0] == ':':
-            if len(tokens) >= 2 and is_float(tokens[1].strip()):
-                if len(tokens) < 3 or parse_prompt_keyword(tokens[2])[0] is not None or tokens[2] == ']' and depth == 0:
-                    tokens.pop(0)
-                    weight = float(tokens.pop(0).strip())
-                    break
-        elif next_keyword is not None:
+                depth_square = max(0, depth_square - 1)
+                parts.append(tokens.pop(0))
+            continue
+
+        if (
+            token == ','
+            and nested
+            and depth_square == 0
+            and depth_brace == 0
+            and depth_paren == 0
+        ):
+            tokens.pop(0)
             break
 
-        text += tokens.pop(0)
+        if (
+            keyword is not None
+            and depth_square == 0
+            and depth_brace == 0
+            and depth_paren == 0
+        ):
+            break
 
-    return text, weight
+        part = tokens.pop(0)
+        parts.append(part)
+        if any(ch in part for ch in '{}()[]'):
+            depth_square, depth_brace, depth_paren = _update_delimiter_depths(
+                part, depth_square, depth_brace, depth_paren
+            )
+
+    text = ''.join(parts)
+    prompt_text, weight = extract_prompt_and_weight(text)
+    return prompt_text, weight
+
+
+def _update_delimiter_depths(
+    fragment: str,
+    depth_square: int,
+    depth_brace: int,
+    depth_paren: int,
+) -> Tuple[int, int, int]:
+    i = 0
+    while i < len(fragment):
+        ch = fragment[i]
+        if ch == '\\':
+            i += 2
+            continue
+        if ch == '[':
+            depth_square += 1
+        elif ch == ']':
+            depth_square = max(0, depth_square - 1)
+        elif ch == '{':
+            depth_brace += 1
+        elif ch == '}':
+            depth_brace = max(0, depth_brace - 1)
+        elif ch == '(':
+            depth_paren += 1
+        elif ch == ')':
+            depth_paren = max(0, depth_paren - 1)
+        i += 1
+
+    return depth_square, depth_brace, depth_paren
 
 
 def parse_weight(tokens: List[str]) -> float:
@@ -211,7 +279,7 @@ def tokenize(s: str):
     prompt_keywords_regex = '|'.join(rf'\b{keyword}\b' for keyword in prompt_keywords)
     alignment_regex = rf'{PromptKeyword.AND_ALIGN.value}_\d+_\d+|{PromptKeyword.AND_MASK_ALIGN.value}_\d+_\d+'
     transform_regex = '|'.join(rf'\b{keyword}\b' for keyword in affine_transforms_keys())
-    pattern = rf'(\[|\]|:|{prompt_keywords_regex}|{alignment_regex}|{transform_regex})'
+    pattern = rf'(\[|\]|:|,|{prompt_keywords_regex}|{alignment_regex}|{transform_regex})'
     return [s for s in re.split(pattern, s) if s.strip()]
 
 
@@ -327,6 +395,128 @@ def is_float(string: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def extract_prompt_and_weight(text: str) -> Tuple[str, float]:
+    text = text or ''
+
+    if ':' not in text and '：' not in text:
+        return text, 1.0
+
+    colon_index = _find_last_top_level_colon(text)
+    if colon_index is not None:
+        trailing = text[colon_index + 1 :].strip()
+        if trailing and webui_prompt_parser.RE_NUMERIC_FULL.fullmatch(trailing):
+            try:
+                return text[:colon_index], float(trailing)
+            except ValueError:
+                pass
+
+    parts = webui_prompt_parser._split_top_level_colon_keep_empty(text)
+    if len(parts) >= 2:
+        weight_candidate = parts[-1].strip()
+        if weight_candidate and webui_prompt_parser.RE_NUMERIC_FULL.fullmatch(weight_candidate):
+            colon_index = _find_last_top_level_colon(text)
+            if colon_index is None:
+                colon_index = text.rfind(':')
+            if colon_index is not None:
+                prompt = text[:colon_index]
+                try:
+                    return prompt, float(weight_candidate)
+                except ValueError:
+                    pass
+
+    fallback_colon = text.rfind(':')
+    if fallback_colon >= 0:
+        trailing = text[fallback_colon + 1 :].strip()
+        if trailing and webui_prompt_parser.RE_NUMERIC_FULL.fullmatch(trailing):
+            try:
+                return text[:fallback_colon], float(trailing)
+            except ValueError:
+                pass
+
+    weight_from_lark = _detect_weight_with_lark(text)
+    if weight_from_lark is not None:
+        colon_index = _find_last_top_level_colon(text)
+        if colon_index is None:
+            colon_index = text.rfind(':')
+            if colon_index < 0:
+                return text, weight_from_lark
+        if colon_index is not None:
+            prompt = text[:colon_index]
+            return prompt, weight_from_lark
+
+    return text, 1.0
+
+
+def _detect_weight_with_lark(text: str) -> Optional[float]:
+    normalized = webui_prompt_parser._apply_and(text)
+    try:
+        tree = webui_prompt_parser.schedule_parser.parse(normalized)
+    except lark.LarkError:
+        return None
+
+    prompt_node = _first_prompt_node(tree)
+    if prompt_node is None:
+        return None
+
+    relevant_children = [child for child in prompt_node.children if not _is_whitespace(child)]
+    if len(relevant_children) != 1:
+        return None
+
+    weighted_node = relevant_children[0]
+    if not isinstance(weighted_node, lark.Tree) or weighted_node.data != 'weighted':
+        return None
+
+    number_token = weighted_node.children[-1]
+    try:
+        return float(str(number_token))
+    except ValueError:
+        return None
+
+
+def _find_last_top_level_colon(text: str) -> Optional[int]:
+    depth_square = depth_brace = depth_paren = 0
+    i = 0
+    positions: List[int] = []
+
+    while i < len(text):
+        ch = text[i]
+        if ch == '\\':
+            i += 2
+            continue
+        if ch == '[':
+            depth_square += 1
+        elif ch == ']':
+            depth_square = max(0, depth_square - 1)
+        elif ch == '{':
+            depth_brace += 1
+        elif ch == '}':
+            depth_brace = max(0, depth_brace - 1)
+        elif ch == '(':
+            depth_paren += 1
+        elif ch == ')':
+            depth_paren = max(0, depth_paren - 1)
+        elif ch == ':' and depth_square == depth_brace == depth_paren == 0:
+            positions.append(i)
+
+        i += 1
+
+    if not positions:
+        return None
+
+    return positions[-1]
+
+
+def _first_prompt_node(tree: lark.Tree) -> Optional[lark.Tree]:
+    for child in tree.children:
+        if isinstance(child, lark.Tree) and child.data == 'prompt':
+            return child
+    return None
+
+
+def _is_whitespace(node: Any) -> bool:
+    return isinstance(node, lark.Token) and node.type == 'WHITESPACE'
 
 
 if __name__ == '__main__':
